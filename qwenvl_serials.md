@@ -21,15 +21,14 @@ miniconda3/lib/python3.12/site-packages/qwen_vl_utils/vision_process.py(autodl)(
 - huggingface files  
 config.json  
 tokenizer.json  
-preprocessor_config.json
+preprocessor_config.json  
 generation_config.json
 
 - 模型参数  
 transformers/src/transformers/models/qwen2_vl/processing_qwen2_vl.py  
 transformers/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py  
 transformers/src/transformers/models/qwen3_vl/video_processing_qwen3_vl.py  
-transformers/src/transformers/models/qwen3_vl/configuration_qwen3_vl.py  
-huggingface config.json
+transformers/src/transformers/models/qwen3_vl/configuration_qwen3_vl.py
 
 
 # 对比
