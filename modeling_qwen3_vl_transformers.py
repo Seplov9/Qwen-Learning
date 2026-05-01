@@ -1,0 +1,917 @@
+import itertools
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ... import initialization as init
+from ...activations import ACT2FN
+from ...cache_utils import Cache, DynamicCache
+from ...generation import GenerationMixin
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+from ...masking_utils import create_causal_mask
+from ...modeling_flash_attention_utils import FlashAttentionKwargs
+from ...modeling_layers import GradientCheckpointingLayer
+from ...modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ...processing_utils import Unpack
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, torch_compilable_check
+from ...utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
+from ...utils.output_capturing import capture_outputs
+from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
+
+
+@dataclass  # 指示 Python 将该类自动转换为数据类，自动生成 __init__、__repr__ 等方法
+@auto_docstring  # 这是一个装饰器（常见于某些框架），用于根据类属性自动生成或补充文档字符串
+class BaseModelOutputWithDeepstackFeatures(BaseModelOutputWithPooling):
+    r"""
+    BaseModelOutputWithDeepstackFeatures 类继承自 BaseModelOutputWithPooling。
+    它不仅包含基础模型输出（如 hidden_states）和池化输出（pooled_output），
+    还额外增加了对 Deepstack（深度堆叠）层特征的存储支持。
+
+    参数说明：
+    deepstack_features (`List[torch.FloatTensor]`, *可选*):
+        来自模型“深度堆叠”层的隐藏状态（特征图）列表。
+    """
+
+    # 定义属性 deepstack_features：
+    # 类型为 torch.FloatTensor 的列表，或者为 None
+    # 默认值设置为 None
+    deepstack_features: list[torch.FloatTensor] | None = None
+
+
+class Qwen3VLVisionMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # 模型的隐藏层维度（输入/输出维度），例如 1024
+        self.hidden_size = config.hidden_size 
+        
+        # 中间层扩充维度，通常是 hidden_size 的 4 倍（如 4096）
+        self.intermediate_size = config.intermediate_size 
+        
+        # 第一层全连接：从 hidden_size 映射到 intermediate_size
+        # 权重维度: [intermediate_size, hidden_size]
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        
+        # 第二层全连接：将维度还原回 hidden_size
+        # 权重维度: [hidden_size, intermediate_size]
+        self.linear_fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+        
+        # 激活函数，通常使用 GeLU 或 SwiGLU 变体
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_state):
+        # 输入 hidden_state 维度: [Batch, Sequence_Length, hidden_size]
+        
+        # 1. 第一层映射：[B, S, hidden_size] -> [B, S, intermediate_size]
+        x = self.linear_fc1(hidden_state)
+        
+        # 2. 激活函数处理：维度保持 [B, S, intermediate_size]
+        x = self.act_fn(x)
+        
+        # 3. 第二层映射：[B, S, intermediate_size] -> [B, S, hidden_size]
+        x = self.linear_fc2(x)
+        
+        return x
+
+
+class Qwen3VLVisionPatchEmbed(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        # 提取配置参数
+        self.patch_size = config.patch_size  # 空间维度的 Patch 大小 (如 14)
+        self.temporal_patch_size = config.temporal_patch_size  # 时间维度的 Patch 大小 (如 2)
+        self.in_channels = config.in_channels  # 输入通道数 (如 3)
+        self.embed_dim = config.hidden_size  # 映射后的 Embedding 维度 (如 1024)
+
+        # 卷积核大小设置为 [时间步, 高度, 宽度]
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        
+        # 使用 3D 卷积进行线性投影。步长(stride)等于核大小(kernel_size)，确保 Patch 之间不重叠
+        # 输入维度: (Batch, C_in, T, H, W)
+        # 输出维度: (Batch, Embed_dim, T', H', W') 其中 T'=T/temporal_patch_size, H'=H/patch_size
+        self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 获取权重的数据类型（如 float16 或 bfloat16），确保计算精度一致
+        target_dtype = self.proj.weight.dtype
+        
+        # 【重塑维度】 将输入展平为 Conv3d 期待的 5D Tensor
+        # 假设原始 hidden_states 为 (Total_Patches, -1)
+        # 变换后维度: (N, C_in, T_patch, H_patch, W_patch) 
+        # 此处的 N 是为了处理被切分后的局部块
+        hidden_states = hidden_states.view(
+            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
+        )
+        
+        # 【执行投影】 
+        # 1. hidden_states.to(dtype=target_dtype): 类型转换
+        # 2. self.proj(...): 执行 3D 卷积。由于输入刚好等于核大小，卷积后空间维度变为 1x1x1
+        #    卷积输出维度: (N, Embed_dim, 1, 1, 1)
+        # 3. .view(-1, self.embed_dim): 展平为二维矩阵
+        #    最终输出维度: (N, Embed_dim)
+        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        
+        return hidden_states
+
+
+class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    # 定义类型注解，告知 Linter inv_freq 是一个 Tensor 类型的缓冲区
+    inv_freq: torch.Tensor  
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim      # 嵌入维度（通常为 head_dim 的一部分）
+        self.theta = theta  # 基数（Base），用于控制不同维度的旋转频率
+
+        # 计算逆频率向量 (Inverse Frequency)
+        # torch.arange(0, dim, 2): 生成 [0, 2, 4, ..., dim-2]，维度为 (dim/2,)
+        # 计算公式: 1.0 / (theta ** (i / dim))
+        # inv_freq 维度: [dim / 2]
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        
+        # 将 inv_freq 注册为 buffer，不会被视为模型参数（不更新梯度）
+        # persistent=False 表示该 buffer 不会保存到 state_dict 中
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seqlen: int) -> torch.Tensor:
+        # 生成位置索引序列: [0, 1, 2, ..., seqlen-1]
+        # seq 维度: [seqlen]
+        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        
+        # 计算外积 (Outer Product)
+        # seq (seqlen,) 与 inv_freq (dim/2,) 相乘
+        # freqs 维度: [seqlen, dim / 2]
+        freqs = torch.outer(seq, self.inv_freq)
+        
+        # 返回计算好的频率矩阵，后续通常会配合 sin/cos 使用
+        # 返回维度: [seqlen, dim / 2]
+        return freqs
+
+
+class Qwen3VLVisionPatchMerger(nn.Module):
+    def __init__(self, config: Qwen3VLVisionConfig, use_postshuffle_norm=False) -> None:
+        super().__init__()
+        # 计算合并后的隐藏层维度。
+        # 维度变化：hidden_size = D * (S^2)，其中 S 是 spatial_merge_size（通常为 2）。
+        # 如果 S=2，则维度扩大 4 倍。
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        
+        # 是否在像素重组（Pixel Shuffle/Reshape）之后才进行归一化。
+        self.use_postshuffle_norm = use_postshuffle_norm
+        
+        # 归一化层：
+        # 如果 postshuffle，则 LayerNorm 作用于扩大后的维度 (D * S^2)；
+        # 否则作用于原始维度 D。
+        self.norm = nn.LayerNorm(self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6)
+        
+        # 第一层线性变换：输入和输出维度均为 (D * S^2)。
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        
+        # 激活函数，通常为 GELU。
+        self.act_fn = nn.GELU()
+        
+        # 第二层线性变换：将特征投影到 LLM 接收的维度 (config.out_hidden_size)。
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 输入 x 的初始维度: (B, L, D) 
+        # 其中 L = H * W (原始图像切分后的宽高)
+        
+        # 第一步：LayerNorm 与 Reshape (Pixel Shuffle 逻辑)
+        # 如果 use_postshuffle_norm 为 False:
+        #   1. 先对 x (B, L, D) 进行 norm -> 维度保持 (B, L, D)
+        #   2. 执行 view(-1, hidden_size) -> 维度变为 (B, L/S^2, D*S^2)
+        # 如果 use_postshuffle_norm 为 True:
+        #   1. 先执行 view(-1, hidden_size) -> 维度变为 (B, L/S^2, D*S^2)
+        #   2. 对变换后的张量进行 norm -> 维度保持 (B, L/S^2, D*S^2)
+        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(-1, self.hidden_size)
+        
+        # 此时 x 的维度: (B * L/S^2, D * S^2)
+        
+        # 第二步：通过 MLP 结构进行特征融合与维度投影
+        # linear_fc1: (B * L/S^2, D * S^2) -> (B * L/S^2, D * S^2)
+        # act_fn: 维度不变
+        # linear_fc2: (B * L/S^2, D * S^2) -> (B * L/S^2, out_hidden_size)
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        
+        # 返回结果维度: (B * L/S^2, out_hidden_size)
+        # 注：通常在实际输出前会根据 Batch Size 重新 reshape 回 (B, L/S^2, out_hidden_size)
+        return x
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # 记录原始数据类型（通常是 bfloat16 或 float16），以便最后还原
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+
+    # 将 q 和 k 转换为 float32 以保证旋转运算的数值稳定性
+    # q, k 维度: [B, L, H, D] (Batch, Length, Heads, Head_dim)
+    q, k = q.float(), k.float()
+
+    # 对 cos 和 sin 进行升维，增加一个维度以对齐 Head_dim 之前的维度
+    # 输入 cos/sin 维度通常为: [L, D] 或 [B, L, D]
+    # unsqueeze(-2) 后变为: [L, 1, D] 或 [B, L, 1, D]，确保能通过广播机制应用到所有 Head (H) 上
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+
+    # 应用旋转变换公式：q_new = q * cos(mθ) + rotate_half(q) * sin(mθ)
+    # rotate_half 的作用是将向量的后半部分取负并与前半部分交换，模拟复数乘法
+    # q_embed 维度: [B, L, H, D]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    
+    # 对 Key (k) 执行相同的旋转操作
+    # k_embed 维度: [B, L, H, D]
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    # 将结果转换回原始的高性能低精度格式（如 bf16）
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    此函数的作用是将 KV 头的数量重复 n_rep 次，以匹配 Query 头的数量。
+    输入维度: (batch, num_key_value_heads, seqlen, head_dim)
+    n_rep: 重复次数，通常为 num_attention_heads // num_key_value_heads
+    """
+    
+    # 1. 获取输入张量的原始维度信息
+    # batch: 批量大小, num_key_value_heads: KV头的数量, slen: 序列长度, head_dim: 每个头的维度
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    
+    # 2. 如果重复次数为1，说明 KV 头数量已经等于 Query 头数量（即标准的 Multi-Head Attention）
+    # 直接返回原张量，无需操作
+    if n_rep == 1:
+        return hidden_states
+    
+    # 3. 维度扩展 (Expansion)
+    # hidden_states[:, :, None, :, :] 在第 2 维（索引从0开始）插入一个新维度。
+    # 插入后维度变为: (batch, num_key_value_heads, 1, slen, head_dim)
+    # .expand(...) 将这个新增的维度从 1 广播（重复）到 n_rep。
+    # 此时维度变为: (batch, num_key_value_heads, n_rep, slen, head_dim)
+    # 注：expand 不会分配新内存，只是创建了视图，效率极高。
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    
+    # 4. 维度重塑 (Reshape)
+    # 将 num_key_value_heads 和 n_rep 合并到同一个维度。
+    # 结果维度: (batch, num_key_value_heads * n_rep, slen, head_dim)
+    # 这里的 num_key_value_heads * n_rep 实际上就等于总的 num_attention_heads。
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,              # 传入的注意力模块实例，用于获取配置参数（如 head 数量）
+    query: torch.Tensor,           # 查询向量 [batch, num_heads, seq_len, head_dim]
+    key: torch.Tensor,             # 键向量 [batch, num_kv_heads, seq_len, head_dim]
+    value: torch.Tensor,           # 值向量 [batch, num_kv_heads, seq_len, head_dim]
+    attention_mask: torch.Tensor | None, # 掩码，用于遮蔽无效位置（如 Padding 或 Causal 掩码）
+    scaling: float,                # 缩放因子，通常为 1 / sqrt(head_dim)
+    dropout: float = 0.0,          # Dropout 概率
+    **kwargs: Unpack[TransformersKwargs],
+):
+    # 1. 针对 Grouped Query Attention (GQA)，将 Key 重复扩展以匹配 Query 的 Head 数量
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    # 2. 同理，将 Value 重复扩展
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    # 3. 核心计算：Q 乘以 K 的转置，计算注意力分数（矩阵乘法）
+    # 结果维度: [batch, num_heads, seq_len, seq_len]
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+
+    # 4. 如果有掩码（如处理变长输入或因果遮蔽），将其加到分数上（通常掩码处为极负数）
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    # 5. 在最后一个维度做 Softmax，使权重归一化到 [0, 1] 且和为 1
+    # 强制转为 float32 计算以保证数值稳定性，最后转回 Query 的原始精度
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+
+    # 6. 对注意力权重进行 Dropout 随机失活，防止过拟合
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # 7. 将权重作用于 Value 向量上，得到最终的上下文表示
+    # 结果维度: [batch, num_heads, seq_len, head_dim]
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    # 8. 调整维度顺序，将多头拼接到一起，并确保内存连续（以便后续 View/Reshape 操作）
+    # 结果维度: [batch, seq_len, num_heads, head_dim]
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+class Qwen3VLVisionAttention(nn.Module):
+    def __init__(self, config: Qwen3VLVisionConfig) -> None:
+        super().__init__()
+        self.dim = config.hidden_size      # 隐藏层维度，例如 1280
+        self.num_heads = config.num_heads  # 注意力头数，例如 16
+        self.head_dim = self.dim // self.num_heads # 每个头的维度，例如 1280/16 = 80
+        
+        # 为了兼容不同的 Attention 实现（如 GQA 逻辑），设置 KV 组数为 1
+        self.num_key_value_groups = 1  
+        
+        # 定义 QKV 投影层：将输入映射到 3 倍维度 (Q, K, V)
+        # [dim] -> [3 * dim]
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+        
+        # 定义输出投影层：将注意力结果映射回原始维度
+        # [dim] -> [dim]
+        self.proj = nn.Linear(self.dim, self.dim)
+        
+        # 缩放因子：1 / sqrt(head_dim)
+        self.scaling = self.head_dim**-0.5
+        self.config = config
+        self.attention_dropout = 0.0
+        self.is_causal = False # 视觉编码器通常使用双向注意力，非因果
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor, # 输入特征: [L, dim]
+        cu_seqlens: torch.Tensor,    # 累积序列长度: [batch_size + 1]，用于区分拼在一起的不同图片
+        # 假设 Batch 中有 3 张图片，patch 数量分别为：图片 0: 5 个 token图片 1: 3 个 token图片 2: 4 个 token拼接后的总长度 L = 5 + 3 + 4 = 12。那么对应的 cu_seqlens 为：[0, 5, 8, 12]
+        rotary_pos_emb: torch.Tensor | None = None, # 备用 RoPE
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, # (cos, sin) 
+        **kwargs,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0] # L
+        
+        # 1. 线性投影并切分为 Q, K, V
+        # self.qkv(hidden_states) -> [L, 3 * dim]
+        # .reshape(L, 3, num_heads, head_dim)
+        # .permute(1, 0, 2, 3) -> [3, L, num_heads, head_dim]
+        # .unbind(0) -> 得到三个 [L, num_heads, head_dim] 的张量
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )
+
+        # 2. 应用视觉旋转位置编码 (Vision RoPE)
+        # cos, sin 维度通常为 [L, head_dim]
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+        # 3. 维度转换，为后续 Attention 接口做准备
+        # transpose(0, 1) -> [num_heads, L, head_dim]
+        # unsqueeze(0) -> [1, num_heads, L, head_dim]
+        query_states = query_states.transpose(0, 1).unsqueeze(0)
+        key_states = key_states.transpose(0, 1).unsqueeze(0)
+        value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+        # 获取具体的注意力实现函数
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        if is_flash_attention_requested(self.config):
+            # --- 情况 1: 使用 Flash Attention ---
+            # 通过 cu_seqlens 计算当前批次中最大的单序列长度
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            
+            # Flash Attention 能够利用 cu_seqlens 直接在打包好的 [1, num_heads, L, head_dim] 上计算
+            # 它内部会根据索引切分不同图片的注意力范围，防止跨图片干扰
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                cu_seq_lens_q=cu_seqlens, # 关键：指示序列边界
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                is_causal=False,
+                **kwargs,
+            )
+        else:
+            # --- 情况 2: 常规实现 (Eager/SDPA(Scaled Dot Product Attention)) ---
+            # 由于不支持 cu_seqlens，需要手动把 L 维按长度切开
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            
+            # 将 Q, K, V 分别切成 list，每个元素对应一张图片
+            # 输入维度：此时的 query_states 等张量的维度是 [1, num_heads, L, head_dim]。
+            # 操作：在 dim=2（即 L 这一维）上，按照刚才算出的 lengths 长度进行切片。
+            # 结果：将一个巨大的张量切分成一个张量列表（List of Tensors）。
+            # q_list[0] 形状：[1, num_heads, 5, head_dim] （图片 0）
+            # q_list[1] 形状：[1, num_heads, 3, head_dim] （图片 1）
+            # q_list[2] 形状：[1, num_heads, 4, head_dim] （图片 2）
+            # q 的 shape list: [[1, num_heads, len_i, head_dim], ...]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+            ]
+
+            # 循环计算每一张图片的注意力
+            attn_outputs = [
+                attention_interface(
+                    self, q, k, v,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    is_causal=False,
+                    **kwargs,
+                )[0]
+                for q, k, v in zip(*splits)
+            ]
+            # 拼接结果: [1, L, num_heads, head_dim]
+            attn_output = torch.cat(attn_outputs, dim=1)
+
+        # 4. 恢复维度并投影
+        # attn_output 原始维度: [1, L, num_heads, head_dim] 或 Flash 输出的变体
+        # reshape(seq_length, -1) -> [L, dim]
+        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        
+        # 最后的线性映射 [L, dim] -> [L, dim]
+        attn_output = self.proj(attn_output)
+        
+        return attn_output
+
+
+# 继承自 GradientCheckpointingLayer，旨在支持梯度检查点以节省显存
+class Qwen3VLVisionBlock(GradientCheckpointingLayer):
+    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+        super().__init__()
+        # 初始化第一层归一化：用于 Self-Attention 之前
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        
+        # 初始化第二层归一化：用于 MLP 之前
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        
+        # 视觉自注意力模块：负责 Patch 之间的空间信息交互
+        self.attn = Qwen3VLVisionAttention(config=config)
+        
+        # 多层感知机：负责对每个 Patch 的特征进行非线性映射与维度变换
+        self.mlp = Qwen3VLVisionMLP(config=config)
+
+    @auto_docstring
+    def forward(
+        self,
+        hidden_states: torch.Tensor, # 输入维度: [N, D]
+        cu_seqlens: torch.Tensor,    # 维度: [Batch_Size + 1], 记录每张图片在 N 中的起始位置
+        rotary_pos_emb: torch.Tensor | None = None, # 维度: [N, Head_Dim], 旋转位置编码
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, # 可选的 2D/3D 位置偏移
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        cu_seqlens: 用于处理非填充（unpadded）的变长数据，提高计算效率。
+        rotary_pos_emb: 应用于 Q 和 K 的旋转位置编码，增强模型对空间位置的感知。
+        """
+        
+        # --- 第一阶段：注意力机制与残差连接 ---
+        # 1. self.norm1(hidden_states): [N, D] -> [N, D] (层归一化，稳定梯度)
+        # 2. self.attn(...): 计算注意力，输出维度 [N, D]
+        # 3. hidden_states + ...: 残差连接，防止梯度消失
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        # --- 第二阶段：前馈网络（MLP）与残差连接 ---
+        # 1. self.norm2(hidden_states): [N, D] -> [N, D]
+        # 2. self.mlp(...): [N, D] -> [N, D] (通常内部会先升维再降维)
+        # 3. hidden_states + ...: 再次残差连接
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+
+        # 返回更新后的特征表示，维度: [N, D]
+        return hidden_states
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # 1. 记录输入数据的原始精度 (例如 torch.float16 或 torch.bfloat16)
+        input_dtype = hidden_states.dtype 
+        
+        # 2. 转换为 float32 提高计算精度，避免在平方求和时溢出
+        # hidden_states 维度: [B, L, D] (类型: float32)
+        hidden_states = hidden_states.to(torch.float32) 
+        
+        # 3. 计算均方值 (Mean Square): 对最后一个维度 D 求平方后取平均
+        # hidden_states.pow(2) 维度: [B, L, D]
+        # .mean(-1, keepdim=True) 维度: [B, L, 1]
+        variance = hidden_states.pow(2).mean(-1, keepdim=True) 
+        
+        # 4. 归一化计算: 
+        # rsqrt 是 1/sqrt(x)，即计算 1 / sqrt(方差 + eps)
+        # 然后将输入 hidden_states 乘以这个缩放因子
+        # hidden_states 维度: [B, L, D] (此时内部元素已完成归一化)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        
+        # 5. 仿射变换与类型转换:
+        # self.weight * hidden_states: 将归一化的结果乘以可学习参数 weight (维度 [D])，利用广播机制作用于每一行
+        # 最后 .to(input_dtype) 将精度转回 FP16/BF16 以匹配后续层
+        # 返回维度: [B, L, D]
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class Qwen3VLTextRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # 逆频率张量，用于计算旋转角度
+
+    def __init__(self, config: Qwen3VLTextConfig, device=None):
+        super().__init__()
+        # 这里的 max_seq_len 通常指文本的最大位置
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        # 获取 RoPE 类型，默认通常是 "default" 或 "linear"
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        
+        # 计算逆频率 (inv_freq) 和 缩放因子 (attention_scaling)
+        # inv_freq 维度: [head_dim // 2]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        # 注册为 buffer，不参与梯度更新
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+        # mrope_section 是关键：它定义了 head_dim // 2 如何分配给 T, H, W
+        # 默认 [24, 20, 20] 表示总共 64 组频率对（即 head_dim=128）
+        self.mrope_section = config.rope_parameters.get("mrope_section", [24, 20, 20])
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: Qwen3VLTextConfig | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        # 获取 base (通常是 10000 或更大的值，如 1000000 用于长文本)
+        base = config.rope_parameters["rope_theta"]
+        # 计算每个头的维度 (head_dim)
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0
+
+        # 计算频率公式：1 / (base ^ (2i / dim))
+        # torch.arange(0, dim, 2) 产生 [0, 2, 4, ..., dim-2]，长度为 dim//2
+        # inv_freq 维度: [dim // 2]
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(self, x, position_ids):
+        """
+        x: 输入张量，维度 [batch_size, seq_len, num_heads, head_dim]
+        position_ids: 位置索引，维度 [3, batch_size, seq_len] (对应 T, H, W)
+        注意：如果输入是纯文本，position_ids 会在下面被扩展
+        """
+        # 如果 position_ids 只有 2 维 [bs, seq_len]，说明只有一组位置（通常是文本）
+        # 则在第 0 维扩展 3 倍，使其变成 [3, bs, seq_len]，模拟 T, H, W 坐标相同
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        # 准备频率矩阵
+        # self.inv_freq 原本维度 [dim // 2]
+        # inv_freq_expanded 维度变化: [1, 1, dim // 2, 1] -> [3, bs, dim // 2, 1]
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        
+        # position_ids_expanded 维度变化: [3, bs, seq_len] -> [3, bs, 1, seq_len]
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            # 计算旋转角度 (Theta)
+            # 矩阵乘法: [3, bs, dim//2, 1] @ [3, bs, 1, seq_len] -> [3, bs, dim//2, seq_len]
+            # transpose 后维度: [3, bs, seq_len, dim // 2]
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+            
+            # 调用 M-RoPE 特有的交错逻辑（见下文）
+            # freqs 维度变为: [bs, seq_len, dim // 2]
+            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+            
+            # 拼接频率以匹配完整的 head_dim
+            # emb 维度: [bs, seq_len, dim]
+            emb = torch.cat((freqs, freqs), dim=-1)
+            
+            # 计算 cos 和 sin
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        # 返回与输入 x 相同数据类型的 cos/sin，维度均位 [bs, seq_len, dim]
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """
+        freqs: [3, bs, seq_len, head_dim // 2]
+        mrope_section: 列表，例如 [24, 20, 20]，总和应为 head_dim // 2
+        """
+        # 取出时间维度 (T) 的完整频率作为基底
+        # freqs_t 维度: [bs, seq_len, head_dim // 2]
+        freqs_t = freqs[0]  
+        
+        # 遍历 H (dim=1) 和 W (dim=2)
+        for dim, offset in enumerate((1, 2), start=1):
+            # length 是该部分在 head_dim 中占据的总宽度（乘以 3 是因为逻辑分布）
+            length = mrope_section[dim] * 3
+            
+            # 这里的逻辑是：在 head_dim // 2 这个维度上
+            # 并不是简单的前 24 维给 T，中间 20 维给 H
+            # 而是采用交错索引 (slice(offset, length, 3))
+            # 例如对于 H (offset=1): 会修改索引 1, 4, 7... 的位置
+            # 对于 W (offset=2): 会修改索引 2, 5, 8... 的位置
+            # 这样保证了 T, H, W 的信息在 Embedding 空间中是交织分布的
+            idx = slice(offset, length, 3)
+            
+            # 将对应维度的频率覆盖到 freqs_t 中
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+            
+        return freqs_t
+
+
+# 使用装饰器，可能用于从 Hub 加载优化的算子（如 Triton 或 CUDA 内核）以加速推理/训练
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen3VLTextRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        Qwen3VLTextRMSNorm 等价于 T5 模型的 LayerNorm 结构。
+        :param hidden_size: 隐藏层的维度大小 (int)
+        :param eps: 为了数值稳定性防止除以 0 而添加的一个极小值 (float)
+        """
+        super().__init__()
+        # 初始化可学习的权重参数 weight，形状为 [hidden_size]
+        # 初始值全部为 1，代表初始状态下不对归一化后的结果做缩放改变
+        self.weight = nn.Parameter(torch.ones(hidden_size)) 
+        
+        # 保存 epsilon 值
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播计算
+        :param hidden_states: 输入张量，维度通常为 [batch_size, seq_len, hidden_size]
+        """
+        # 记录输入张量的原始数据类型 (如 float16 或 bfloat16)
+        input_dtype = hidden_states.dtype
+        
+        # 将输入转换为 float32 以保证计算均方根时的精度，避免溢出
+        # hidden_states 维度: [B, L, D] (B=Batch, L=SeqLen, D=HiddenSize)
+        hidden_states = hidden_states.to(torch.float32)
+        
+        # 计算均方值 (Mean Square)：将每个特征维度取平方后，在最后一个维度 (-1) 求平均
+        # variance 维度: [B, L, 1]
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        
+        # 核心公式：x = x * 1 / sqrt(variance + eps)
+        # torch.rsqrt 是平方根的倒数，能一步完成开根号和取倒数的操作
+        # hidden_states 维度: [B, L, D]
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        
+        # 将归一化后的数据转回原始类型，并乘以可学习的权重 self.weight
+        # self.weight 维度 [D] 会通过广播机制应用到 [B, L, D] 上
+        # 返回结果维度: [B, L, D]
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        # 定义在打印模型结构时显示的额外信息 (如维度和 eps)
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+@use_kernel_func_from_hub("rotary_pos_emb")
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    # q, k 维度通常为: [B, H, L, D] (若 unsqueeze_dim=1) 
+    # 或 [B, L, H, D] (若 unsqueeze_dim=2)
+    
+    # cos, sin 初始维度: [L, D] 或 [B, L, D]
+    # 执行 unsqueeze 后，将 cos/sin 插入一个新维度，以便自动广播 (Broadcasting)
+    cos = cos.unsqueeze(unsqueeze_dim) # 维度变为: [B, 1, L, D] 或 [B, L, 1, D]
+    sin = sin.unsqueeze(unsqueeze_dim) # 同上
+    
+    # q * cos: 利用广播机制，cos 会自动在 H 维度复制
+    # rotate_half(q): 维度不变，依然是 [B, H, L, D]
+    q_embed = (q * cos) + (rotate_half(q) * sin) # 维度: [B, H, L, D]
+    k_embed = (k * cos) + (rotate_half(k) * sin) # 维度: [B, H, L, D]
+    
+    return q_embed, k_embed
+
+
+@use_kernelized_func(apply_rotary_pos_emb) # 使用内核优化的旋转位置编码函数
+class Qwen3VLTextAttention(nn.Module):
+    def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
+        super().__init__()
+        # 基础配置信息
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+        self.config = config
+        self.layer_idx = layer_idx
+        
+        # head_dim: 每个注意力头的维度，通常为 hidden_size // num_attention_heads
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        
+        # num_key_value_groups: GQA 分组数，决定了多少个 Q 头共用一组 K/V 头
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        
+        # 缩放因子：1 / sqrt(head_dim)
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True # 因果掩码（自回归）
+
+        # Q 投影层：[hidden_size, num_heads * head_dim]
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        # K 投影层：[hidden_size, num_kv_heads * head_dim] (GQA 模式下输出维度较小)
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        # V 投影层：维度同 K
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        # O 输出投影：[num_heads * head_dim, hidden_size]
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        
+        # QK Norm：在计算注意力得分前对 Q 和 K 进行归一化，有助于训练稳定性
+        # 只在 head_dim 这一维操作
+        self.q_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3VLTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor, # 维度: [B, L, hidden_size]
+        position_embeddings: tuple[torch.Tensor, torch.Tensor], # (cos, sin) 维度均为 [B, L, D] 或支持广播
+        attention_mask: torch.Tensor | None, # 维度: [B, 1, L, L]
+        past_key_values: Cache | None = None, # KV 缓存对象
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        
+        # input_shape = [B, L]
+        input_shape = hidden_states.shape[:-1]
+        # hidden_shape = [B, L, -1, D] 用于后续把投影后的向量 split 成多头
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # 1. 投影并重塑维度
+        # query_states 变换路径: 
+        # [B, L, hidden_size] -> (q_proj) -> [B, L, H*D] -> (view) -> [B, L, H, D] 
+        # -> (q_norm) -> (transpose) -> [B, H, L, D]
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        
+        # key_states 变换路径: 
+        # [B, L, hidden_size] -> (k_proj) -> [B, L, G*D] -> (view) -> [B, L, G, D] 
+        # -> (k_norm) -> (transpose) -> [B, G, L, D]
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        
+        # value_states 变换路径: 
+        # [B, L, hidden_size] -> (v_proj) -> [B, L, G*D] -> (view) -> [B, L, G, D] 
+        # -> (transpose) -> [B, G, L, D]
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # 2. 应用旋转位置编码 (RoPE)
+        # cos/sin 会应用到 Q 和 K 的每一个 head 上
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # 3. 处理 KV Cache (用于推理加速)
+        # 更新后 key/value_states 维度可能变为 [B, G, L_total, D]
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        # 4. 获取注意力计算接口 (可能是 FlashAttention, SDPA 或 Eager 实现)
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        # 5. 执行核心注意力计算
+        # 计算: Softmax( (Q @ K^T) * scaling + mask ) @ V
+        # attn_output 维度: [B, H, L, D]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        # 6. 合并多头并输出
+        # [B, H, L, D] -> (reshape) -> [B, L, H*D]
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        
+        # [B, L, H*D] -> (o_proj) -> [B, L, hidden_size]
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output, attn_weights
+
+
+class Qwen3VLTextMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        # H: 隐藏层维度 (例如 4096)
+        self.hidden_size = config.hidden_size 
+        # I: 中间投影层维度 (通常为 H 的 2.7 到 4 倍，例如 11008)
+        self.intermediate_size = config.intermediate_size 
+
+        # 门控投影层：将 H 维映射到 I 维。权重维度: [I, H]
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        
+        # 上投影层：同样将 H 维映射到 I 维。权重维度: [I, H]
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        
+        # 下投影层：将 I 维映射回 H 维。权重维度: [H, I]
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        
+        # 激活函数：通常是 'silu' (即 Swish)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        """
+        x: 输入张量，维度为 (B, L, H)
+        """
+        # 1. gate_proj(x): (B, L, H) -> (B, L, I)
+        # 2. act_fn(...): 对上一步结果做激活，维度仍为 (B, L, I)
+        # 3. up_proj(x): (B, L, H) -> (B, L, I)
+        # 4. (act * up): 两个 (B, L, I) 张量进行逐元素相乘 (Element-wise Product)
+        # 5. down_proj(...): (B, L, I) -> (B, L, H)
+        
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        
+        return down_proj # 返回维度: (B, L, H)
+
+
+class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size  # 隐藏层维度 H
+
+        # 自注意力机制模块
+        self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
+
+        # 前馈网络模块 (通常包含两层线性映射和激活函数)
+        self.mlp = Qwen3VLTextMLP(config)
+
+        # RMSNorm 归一化层，Pre-Norm 结构使用两个归一化层
+        # 输入归一化：用于注意力机制前
+        self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 注意力后归一化：用于 MLP 前
+        self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,           # 输入维度: [B, S, H]
+        position_embeddings: tuple[torch.Tensor, torch.Tensor], # RoPE 旋转位置编码偏置: ([B, S, D_head], [B, S, D_head])
+        attention_mask: torch.Tensor | None = None,           # 注意力掩码: [B, 1, S, S] 或简化的因果掩码
+        position_ids: torch.LongTensor | None = None,         # 位置 ID: [B, S]
+        past_key_values: Cache | None = None,                 # KV 缓存，用于自回归生成
+        use_cache: bool | None = False,                       # 是否使用 KV 缓存
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        # 1. 暂存残差连接的输入
+        residual = hidden_states  # [B, S, H]
+
+        # 2. Pre-Norm：对输入进行归一化
+        hidden_states = self.input_layernorm(hidden_states)  # [B, S, H]
+
+        # 3. 执行自注意力计算
+        # 注意：这里的 hidden_states 经过了 Norm，但 residual 还是原始输入
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,      # [B, S, H]
+            attention_mask=attention_mask,    # 掩码信息
+            position_ids=position_ids,        # 位置信息
+            past_key_values=past_key_values,  # 缓存信息
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        ) # 返回值维度: [B, S, H]
+
+        # 4. 第一个残差连接：将注意力输出与原始输入相加
+        hidden_states = residual + hidden_states  # [B, S, H]
+
+        # 5. 准备进入 MLP，暂存当前的残差
+        residual = hidden_states  # [B, S, H]
+
+        # 6. Pre-Norm：对进入 MLP 前的数据进行归一化
+        hidden_states = self.post_attention_layernorm(hidden_states)  # [B, S, H]
+
+        # 7. MLP (Feed-Forward Network) 计算
+        # 通常内部逻辑为：Linear -> Silu -> Linear，升维再降维
+        hidden_states = self.mlp(hidden_states)  # [B, S, H]
+
+        # 8. 第二个残差连接：将 MLP 输出与注意力后的状态相加
+        hidden_states = residual + hidden_states  # [B, S, H]
+
+        # 返回最终的隐状态
+        return hidden_states  # [B, S, H]
