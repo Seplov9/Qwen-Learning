@@ -423,126 +423,129 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        cache_params: Cache | None = None,
+        hidden_states: torch.Tensor,     # [B, L, D] (Batch, Seq_Len, Hidden_Size)
+        cache_params: Cache | None = None, 
         attention_mask: torch.Tensor | None = None,
     ):
+        # 0. 掩码处理，处理 Padding
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-
-        # Set up dimensions for reshapes later
+    
+        # B: Batch, L: Seq_Len, D: Hidden_Size
         batch_size, seq_len, _ = hidden_states.shape
-
-        # We have cached `conv_state` / `recurrent_state` to continue from. The two cached modes
-        # (single-token decode and chunk-tokens continuation) share the state read here; they only
-        # diverge in how the conv input is assembled and which kernel consumes the states below,
-        # which we gate locally on `seq_len`.
+    
+        # 1. 检查缓存状态
+        # use_precomputed_states: 只有在非首个 Token 且有 Cache 时为 True
         use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
-
-        # getting projected states from cache if it exists
+    
         if use_precomputed_states:
+            # conv_state: [B, Conv_Dim, K-1] (K为卷积核大小)
+            # recurrent_state: [B, H, HK, HV] (HK, HV 分别为 Key/Value 的头维度)
             conv_state = cache_params.layers[self.layer_idx].conv_states
             recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
-
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        z = self.in_proj_z(hidden_states)
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
+    
+        # 2. 投影生成 QKV 的基础混合张量
+        # self.in_proj_qkv 映射 D -> (2 * key_dim + value_dim)
+        mixed_qkv = self.in_proj_qkv(hidden_states) # [B, L, 2*K_dim + V_dim]
+        mixed_qkv = mixed_qkv.transpose(1, 2)       # [B, 2*K_dim + V_dim, L] (为了进行一维卷积)
+    
+        # 3. 投影生成 门控和控制向量 z, b, a
+        # z: 用于最后的 Gated Norm 处理
+        z = self.in_proj_z(hidden_states)           # [B, L, V_dim]
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim) # [B, L, H, HV]
+    
+        # b: 对应公式中的 beta (写入增益), a: 对应公式中的 g (衰减系数)
+        b = self.in_proj_b(hidden_states)           # [B, L, H] (H 为头的数量)
+        a = self.in_proj_a(hidden_states)           # [B, L, H]
+    
+        # 4. 因果卷积 1D 阶段 (Causal Conv1d)
         if use_precomputed_states and seq_len == 1:
-            # Single-token cached decode: the fused per-step kernel updates the conv state in-place.
+            # 推理阶段 (Decode)：利用专用的高速卷积更新函数，处理单 Token
             mixed_qkv = self.causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
+                mixed_qkv,                          # [B, Conv_Dim, 1]
+                conv_state,                         # [B, Conv_Dim, K-1]
+                self.conv1d.weight.squeeze(1),      # [Conv_Dim, K]
+                self.conv1d.bias,                   # [Conv_Dim]
                 self.activation,
-            )
+            ) # 输出: [B, Conv_Dim, 1]
         else:
-            # Multi-token forward (prefill, or chunked-tokens decode when the cache has prior state).
+            # 预填充阶段 (Prefill)：处理整个序列
             if use_precomputed_states:
-                # Cached chunked-tokens decode: prepend the cached conv context so the causal conv
-                # sees the correct left-context rather than zero-padding. Dropped from the output
-                # at the end of this branch.
-                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
+                # 将旧卷积缓存拼接到新序列前，保证时序连续性
+                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1) # [B, Conv_Dim, K-1 + L]
+            
+            # 如果有缓存对象，更新卷积状态 (取序列末尾 K-1 个 Token)
             if cache_params is not None:
                 new_conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.update_conv_state(new_conv_state, self.layer_idx)
+    
+            # 执行卷积
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
+                    x=mixed_qkv,                    # [B, Conv_Dim, L]
+                    weight=self.conv1d.weight.squeeze(1), 
+                    bias=self.conv1d.bias, 
+                    activation=self.activation
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
+                # 回退到普通 F.conv1d (Silu 激活)
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]]) # [B, Conv_Dim, L]
+            
             if use_precomputed_states:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+                # 如果是续传，只取当前序列长度 L 对应的输出
+                mixed_qkv = mixed_qkv[:, :, -seq_len:] # [B, Conv_Dim, L]
+    
+        # 5. QKV 切分
+        mixed_qkv = mixed_qkv.transpose(1, 2) # [B, L, 2*K_dim + V_dim]
         query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
-            dim=-1,
-        )
-
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        ) # query/key: [B, L, K_dim], value: [B, L, V_dim]
+    
+        # 变形成多头维度
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim) # [B, L, H, HK]
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)   # [B, L, H, HK]
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim) # [B, L, H, HV]
+    
+        # 6. 计算控制参数 (离散化与非线性变换)
+        beta = b.sigmoid() # [B, L, H] - 动态写入门
+        # g: 遗忘门，通过 A_log (由 init 确定的参数) 和 a 进行离散化计算
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias) # [B, L, H]
+    
+        # GQA/MQA 处理：如果 Value 的头比 Key 多，则通过重复对齐
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2) # [B, L, H_v, HK]
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)     # [B, L, H_v, HK]
+    
+        # 7. 线性注意力核心算子 (Delta Rule)
         if use_precomputed_states and seq_len == 1:
+            # 逐 Token 递归模式 (RNN 风格)
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
-
+                query, key, value, g=g, beta=beta, 
+                initial_state=recurrent_state,      # 输入状态: [B, H, HK, HV]
+                output_final_state=cache_params is not None, use_qk_l2norm_in_kernel=True,
+            ) # core_attn_out: [B, 1, H, HV]
         else:
+            # 分块并行模式 (Transformer 训练风格)
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
+                query, key, value, g=g, beta=beta, 
                 initial_state=recurrent_state if use_precomputed_states else None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
-
-        # Update cache
+                output_final_state=cache_params is not None, use_qk_l2norm_in_kernel=True,
+            ) # core_attn_out: [B, L, H, HV]
+    
+        # 8. 缓存更新
         if cache_params is not None:
+            # 存入最新的递归状态 [B, H, HK, HV]
             cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
-
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-
-        output = self.out_proj(core_attn_out)
+    
+        # 9. 归一化与投影输出
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim) # [B*L*H, HV]
+        z = z.reshape(-1, self.head_v_dim)                         # [B*L*H, HV]
+        # 使用 FusedRMSNormGated 或 Qwen3_5RMSNormGated 进行门控归一化
+        core_attn_out = self.norm(core_attn_out, z)                # [B*L*H, HV]
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1) # [B, L, V_dim]
+    
+        # 映射回隐藏层维度
+        output = self.out_proj(core_attn_out) # [B, L, D]
         return output
-
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
