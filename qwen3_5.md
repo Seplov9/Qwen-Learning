@@ -10,10 +10,10 @@
 # 配置
 - 网址：https://huggingface.co/Qwen/Qwen3.5-2B
 
-- 当前Shell
-`$ export OPENAI_BASE_URL="[http://localhost:8000/v1](https://dashscope.aliyuncs.com/compatible-mode/v1)"`
+- 当前Shell  
+`$ export OPENAI_BASE_URL="[http://localhost:8000/v1](https://dashscope.aliyuncs.com/compatible-mode/v1)"`  
 `$ export OPENAI_API_KEY="sk-xxx"`
 
-- 全局配置
-`$ echo 'export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"' >> ~/.bashrc`
+- 全局配置  
+`$ echo 'export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"' >> ~/.bashrc`  
 `$ echo 'export OPENAI_API_KEY="sk-xxx"' >> ~/.bashrc`
