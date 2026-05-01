@@ -22,6 +22,7 @@ miniconda3/lib/python3.12/site-packages/qwen_vl_utils/vision_process.py(autodl)(
 config.json  
 tokenizer.json  
 preprocessor_config.json
+generation_config.json
 
 - 模型参数  
 transformers/src/transformers/models/qwen2_vl/processing_qwen2_vl.py  
